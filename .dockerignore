@@ -1,0 +1,17 @@
+# Keep the bot image lean — exclude the entire web app.
+src
+public
+node_modules
+package.json
+package-lock.json
+vite.config.js
+postcss.config.js
+tailwind.config.js
+components.json
+eslint.config.js
+.git
+.gitignore
+README.md
+AGENTS.md
+CLAUDE.md
+base44
