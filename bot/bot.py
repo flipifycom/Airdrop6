@@ -288,6 +288,13 @@ async def ensure_task(http, bot_username, daily_command, source_group, requires_
         await b44.create(http, "AirdropTask", payload)
 
 
+async def log_action(http, action_type, target_chat, status, details=""):
+    try:
+        await b44.create(http, "ActionLog", {"action_type": action_type, "target_chat": target_chat or "", "status": status, "details": (details or "")[:500], "timestamp": datetime.now(timezone.utc).isoformat()})
+    except Exception as e:
+        log.warning("log_action failed: %s", e)
+
+
 async def notify(client, text):
     if not (TG_BOT_TOKEN and NOTIFY_CHAT_ID):
         return
@@ -417,24 +424,198 @@ async def daily_task_loop(http, client):
                     note = t.get("manual_note") or "manual action needed"
                     await notify(http, f"👤 <b>Manual action needed (daily reminder)</b>\n@{bot}\n{note}\nComplete it so the bot can keep farming.")
                     await b44.update(http, "AirdropTask", t["id"], {"last_performed": now_iso})
-                    try:
-                        await b44.create(http, "ActionLog", {"action_type": "manual_needed",
-                            "target_chat": f"@{bot}", "status": "pending",
-                            "details": note[:500], "timestamp": now_iso})
-                    except Exception:
-                        pass
+                    await log_action(http, "manual_needed", f"@{bot}", "pending", note)
                     continue
                 try:
                     await human_pause(client, bot)
                     await client.send_message(bot, cmd)
                     await b44.update(http, "AirdropTask", t["id"], {"last_performed": now_iso})
-                    await b44.create(http, "ActionLog", {"action_type": "daily_task",
-                        "target_chat": f"@{bot}", "status": "success",
-                        "details": f"sent {cmd}", "timestamp": now_iso})
+                    await log_action(http, "daily_task", f"@{bot}", "success", f"sent {cmd}")
                     log.info("daily task done @%s: %s", bot, cmd)
                 except Exception as e:
                     await notify(http, f"⚠️ Daily task failed for @{bot}: {e}\nPlease check manually.")
+                    await log_action(http, "daily_task", f"@{bot}", "failed", str(e))
+        except Exception as e:
+            log.warning("daily loop failed: %s", e)
+
+
+async def approval_loop(http, client):
+    """Act on signals you approve in the dashboard (human-in-loop)."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            _, _, _, auto_join, _, _, _ = await state.snapshot()
+            signals = await b44.list_raw(http, "AirdropSignal")
+            for s in signals or []:
+                if s.get("status") != "approved" or not s.get("id"):
+                    continue
+                text = s.get("message_text") or ""
+                action = s.get("suggested_action") or ""
+                source_group = s.get("source_group") or ""
+                usernames = list(dict.fromkeys(USERNAME_RE.findall(text + "\n" + (action or ""))))
+                bot_target = next((u for u in usernames if u.lower().endswith("bot")), None)
+                analysis = {"suggested_action": action, "requires_human": False, "daily_command": "", "human_action": ""}
+                source_chat_id = None
+                if source_group:
                     try:
-                        await b44.create(http, "ActionLog", {"action_type": "daily_task",
-                            "target_chat": f"@{bot}", "status": "failed",
-                            "details":
+                        ch = await client.resolve_chat(source_group.lstrip("@"))
+                        source_chat_id = ch.id
+                    except Exception:
+                        pass
+                acts = await perform_action(client, source_chat_id, analysis, text, auto_join)
+                if bot_target:
+                    await ensure_task(http, bot_target, action or "/tap", source_group, False, "")
+                results = [m for _, m in acts]
+                acted = any(ok for ok, _ in acts)
+                now_iso = datetime.now(timezone.utc).isoformat()
+                new_status = "auto_claimed" if acted else "completed"
+                try:
+                    await b44.update(http, "AirdropSignal", s["id"], {"status": new_status})
+                except Exception as e:
+                    log.warning("approve update failed: %s", e)
+                await log_action(http, action or "approve_action", source_group, "success" if acted else "failed", "; ".join(results) or "nothing to do")
+                if acted:
+                    await notify(http, f"✅ <b>Approved airdrop actioned</b>\n{source_group}\n{'; '.join(results)}")
+                log.info("approval actioned @%s -> %s", source_group, new_status)
+        except Exception as e:
+            log.warning("approval loop failed: %s", e)
+
+
+async def research_loop(http, client):
+    while True:
+        await asyncio.sleep(RESEARCH_INTERVAL)
+        try:
+            groups, _, _, _, _, auto_research, targets = await state.snapshot()
+            if not auto_research:
+                continue
+            existing = set(groups)
+            added = 0
+            queries = ["airdrop"] + targets[:3]
+            for q in queries:
+                async for r in client.search_global(q):
+                    chat = r.chat
+                    uname = (getattr(chat, "username", None) or "").lstrip("@")
+                    if not uname or uname in existing:
+                        continue
+                    try:
+                        await b44.create(http, "MonitoredGroup", {"group_username": f"@{uname}", "display_name": getattr(chat, "title", "") or f"@{uname}", "is_active": True, "priority": "low"})
+                        existing.add(uname)
+                        added += 1
+                    except Exception:
+                        pass
+                    if added >= RESEARCH_MAX_NEW:
+                        break
+                if added >= RESEARCH_MAX_NEW:
+                    break
+            log.info("research: added %d new groups", added)
+        except Exception as e:
+            log.warning("research failed: %s", e)
+
+
+async def main():
+    from pyrogram import Client, filters
+    from pyrogram.errors import FloodWait
+
+    app = Client("airdrophunter", api_id=TG_API_ID, api_hash=TG_API_HASH,
+                 session_string=TG_SESSION, no_updates=False)
+    http = httpx.AsyncClient(follow_redirects=True)
+
+    async def refresh_loop():
+        while True:
+            await state.refresh(http)
+            await asyncio.sleep(CONFIG_REFRESH_SECONDS)
+
+    @app.on_message(filters.group)
+    async def on_message(client, message):
+        chat = message.chat
+        username = (chat.username or "").lstrip("@")
+        if not username:
+            return
+        groups, autonomy, ai_prompt, auto_join, auto_tap, _, targets = await state.snapshot()
+        if username not in groups:
+            return
+        text = (message.text or message.caption or "").strip()
+        if not text or len(text) < 15:
+            return
+        source_group = f"@{username}"
+        log.info("new msg from %s (%d chars)", source_group, len(text))
+        try:
+            analysis = await analyze_with_groq(http, text, source_group, ai_prompt, targets)
+        except Exception as e:
+            log.warning("groq failed: %s", e)
+            analysis = {"decision": "UNSURE", "confidence": 0, "reasoning": str(e)[:200],
+                        "suggested_action": "", "is_daily": False, "daily_command": "",
+                        "requires_human": False, "human_action": ""}
+        decision = analysis["decision"]
+        confidence = analysis["confidence"]
+        action = analysis["suggested_action"]
+        now_iso = datetime.now(timezone.utc).isoformat()
+        usernames = list(dict.fromkeys(USERNAME_RE.findall(text + "\n" + (action or ""))))
+        bot_target = next((u for u in usernames if u.lower().endswith("bot")), None)
+        acts = []
+        manual_needed = False
+        if autonomy == "full_autonomy":
+            if analysis.get("requires_human"):
+                note = analysis.get("human_action") or "This airdrop needs a manual step the bot can't do."
+                if bot_target:
+                    await ensure_task(http, bot_target, analysis.get("daily_command") or action or "/tap", source_group, True, note)
+                await notify(http, f"👤 <b>Manual action needed</b>\n{source_group}\nBot: @{bot_target or '-'}\n{note}\n— please complete it manually.")
+                await log_action(http, "manual_needed", source_group, "pending", note)
+                manual_needed = True
+            else:
+                acts += await perform_action(client, chat.id, analysis, text, auto_join)
+                if bot_target:
+                    await ensure_task(http, bot_target, analysis.get("daily_command") or action or "/tap", source_group, False, "")
+                if auto_tap:
+                    acts += await tap_inline_buttons(client, message)
+                fails = [m for ok, m in acts if not ok]
+                if fails:
+                    await notify(http, f"⚠️ Could not fully complete for {source_group}:\n" + "\n".join(fails)[:600] + "\n— please check manually.")
+        results = [m for _, m in acts]
+        acted = any(ok for ok, _ in acts)
+        action_status = "success" if acted else ("pending" if decision == "YES" else "ignored")
+        signal_status = "auto_claimed" if (acted or manual_needed) else ("pending" if decision in ("YES", "UNSURE") else "ignored")
+        try:
+            await b44.create(http, "AirdropSignal", {"source_group": source_group, "message_text": text[:4000], "message_url": f"https://t.me/{username}/{message.id}", "detected_date": now_iso, "ai_decision": decision, "ai_confidence": confidence, "ai_reasoning": analysis["reasoning"], "suggested_action": action, "status": signal_status})
+        except Exception as e:
+            log.warning("create signal failed: %s", e)
+        await log_action(http, action or "evaluate", source_group, action_status, "; ".join(results) or f"ai={decision} conf={confidence}")
+        if decision == "YES":
+            await notify(http,
+                f"🚀 <b>Airdrop YES</b> ({confidence}%)\n{source_group}\n{analysis['reasoning']}\n"
+                f"Action: <code>{action or '-'}</code>\n"
+                f"[{'done: ' + '; '.join(results) if results else autonomy}]")
+
+    @app.on_message(filters.private & filters.bot)
+    async def on_bot_reply(client, message):
+        _, autonomy, _, _, auto_tap, _, _ = await state.snapshot()
+        if autonomy != "full_autonomy" or not auto_tap:
+            return
+        tapped = await tap_inline_buttons(client, message)
+        if tapped:
+            log.info("bot reply tapped: %s", [m for _, m in tapped])
+            tgt = (message.from_user.username if message.from_user else "private") or "private"
+            await log_action(http, "auto_tap", tgt, "success", "; ".join(m for _, m in tapped))
+
+    asyncio.create_task(keepalive_server())
+    await state.refresh(http)
+    asyncio.create_task(refresh_loop())
+    asyncio.create_task(heartbeat_loop(http))
+    asyncio.create_task(research_loop(http, app))
+    asyncio.create_task(daily_task_loop(http, app))
+    asyncio.create_task(approval_loop(http, app))
+    log.info("starting bot (full-auto + daily tasks)…")
+    await app.start()
+    log.info("bot started. monitoring %d groups.", len((await state.snapshot())[0]))
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        await app.stop()
+        await http.aclose()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
